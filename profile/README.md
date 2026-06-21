@@ -22,8 +22,7 @@
 
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/cucuapi/.github/main/profile/assets/siat.png" height="48" alt="SIAT" />&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-<img src="https://raw.githubusercontent.com/cucuapi/.github/main/profile/assets/odoo.png" height="48" alt="Odoo" />
+<img src="https://raw.githubusercontent.com/cucuapi/.github/main/profile/assets/cucubo.svg" width="540" alt="cucu.bo stack" />
 
 </div>
 
