@@ -1,0 +1,67 @@
+# Workflow reutilizable (SSOT) que decide dónde corre el CI de la org: runner self-hosted de mhcloud si
+# está online y libre; si no (PC apagada, ocupado, sin credencial, API caída) -> ubuntu-latest.
+# Falla SIEMPRE hacia ubuntu-latest: nunca deja un pipeline colgado esperando un runner que no existe.
+#
+# Uso en cualquier repo de cucuapi:
+#   jobs:
+#     pick-runner:
+#       uses: cucuapi/.github/.github/workflows/pick-runner.yml@main
+#       secrets: inherit
+#     build:
+#       needs: pick-runner
+#       runs-on: ${{ fromJSON(needs.pick-runner.outputs.runner) }}
+name: pick-runner
+on:
+  workflow_call:
+    inputs:
+      label:
+        description: Label que identifica al runner propio
+        type: string
+        default: mhcloud
+      app-id:
+        description: GitHub App cucu-ci (no es secreto)
+        type: string
+        default: '5435047'
+    secrets:
+      CUCU_CI_APP_PRIVATE_KEY:
+        required: false
+    outputs:
+      runner:
+        description: JSON para runs-on
+        value: ${{ jobs.pick.outputs.runner }}
+
+jobs:
+  pick:
+    name: pick-runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+    steps:
+      - name: Token de la App (solo lectura de runners)
+        id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3.3.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.CUCU_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-organization-self-hosted-runners: read
+
+      - name: Elegir runner
+        id: pick
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          runner='"ubuntu-latest"'
+          if [ -n "$GH_TOKEN" ]; then
+            free=$(curl -fsS --max-time 20 -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/orgs/$ORG/actions/runners?per_page=100" \
+              | jq --arg l "$LABEL" '[.runners[] | select(.status=="online" and .busy==false and any(.labels[]; .name==$l))] | length' || echo 0)
+            if [ "${free:-0}" -gt 0 ]; then runner="[\"self-hosted\",\"$LABEL\"]"; fi
+          fi
+          echo "runner=$runner" >> "$GITHUB_OUTPUT"
+          echo "runner elegido: $runner" >> "$GITHUB_STEP_SUMMARY"
