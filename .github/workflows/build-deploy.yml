@@ -93,7 +93,10 @@ jobs:
         id: meta
         env:
           SERVICE: ${{ inputs.service }}
-        run: echo "tag=${SERVICE}-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          short=$(git rev-parse --short=7 HEAD)
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "tag=${SERVICE}-${short}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -110,6 +113,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ inputs.image }}:${{ steps.meta.outputs.tag }}
           build-args: |
+            APP_VERSION=${{ steps.meta.outputs.short }}
             ${{ inputs.build-args }}
             ${{ secrets.BUILD_ARGS }}
           platforms: linux/amd64
