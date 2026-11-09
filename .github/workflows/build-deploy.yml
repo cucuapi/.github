@@ -1,0 +1,191 @@
+# Workflow reutilizable (SSOT) de entrega: construye la imagen, la publica en Docker Hub y apunta el gitops a ella.
+# ArgoCD hace el resto. Los tests propios de cada repo van en un job anterior, y este se engancha con `needs`.
+#
+# Uso:
+#   permissions:
+#     contents: read
+#   jobs:
+#     verify:
+#       ...
+#     entrega:
+#       needs: verify
+#       uses: cucuapi/.github/.github/workflows/build-deploy.yml@main
+#       with:
+#         service: mi-servicio
+#         values: apps/api/mi-servicio/values-main.yaml
+#       secrets:
+#         DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+#         DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+#         GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+name: build-deploy
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Prefijo del tag de la imagen (<service>-<sha corto>)
+        type: string
+        required: true
+      values:
+        description: Archivos de valores del gitops a actualizar, uno por línea
+        type: string
+        required: true
+      dockerfile:
+        type: string
+        default: ./Dockerfile
+      context:
+        type: string
+        default: .
+      image:
+        type: string
+        default: cucuapi/apps
+      tag-path:
+        description: Ruta yq del tag dentro de los valores
+        type: string
+        default: .image.tag
+      gitops-repo:
+        type: string
+        default: cucuapi/gitops
+      gitops-branch:
+        type: string
+        default: main
+      deploy-branch:
+        description: Rama del repo que despliega; en otra rama sólo se construye
+        type: string
+        default: main
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+      GITOPS_TOKEN:
+        required: true
+    outputs:
+      image-tag:
+        description: Tag publicado
+        value: ${{ jobs.build.outputs.tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Un push más nuevo reemplaza esta construcción: su imagen sería descartada igual.
+    concurrency:
+      group: entrega-${{ inputs.service }}-${{ github.ref }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Calcular el tag
+        id: meta
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: echo "tag=${SERVICE}-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: github.event_name != 'pull_request'
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ inputs.image }}:${{ steps.meta.outputs.tag }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref_name == inputs.deploy-branch
+    # En serie y sin cancelar: si un deploy se corta a la mitad, la imagen queda publicada y nunca desplegada.
+    concurrency:
+      group: entrega-deploy-${{ inputs.service }}-${{ github.ref }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.gitops-repo }}
+          ref: ${{ inputs.gitops-branch }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Apuntar el gitops a la imagen nueva
+        working-directory: gitops
+        shell: bash
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          VALUES: ${{ inputs.values }}
+          TAG_PATH: ${{ inputs.tag-path }}
+        # yq lee el valor real del campo y sólo se reescribe la línea que lo tiene: `yq -i` reformatearía el
+        # archivo entero. Si el valor aparece más de una vez no se adivina: el deploy falla.
+        run: |
+          key=${TAG_PATH##*.}
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            old=$(yq "$TAG_PATH" "$file")
+            if [ "$old" = null ]; then
+              echo "::error file=$file::no existe ${TAG_PATH}"
+              exit 1
+            fi
+            if [ "$old" = "$TAG" ]; then
+              continue
+            fi
+            pattern="^([[:space:]]*${key}:[[:space:]]*)[\"']?${old//./\\.}[\"']?[[:space:]]*(#.*)?$"
+            matches=$(grep -cE "$pattern" "$file" || true)
+            if [ "$matches" != 1 ]; then
+              echo "::error file=$file::${key}: ${old} aparece $matches veces"
+              exit 1
+            fi
+            sed -i -E "s|${pattern}|\1${TAG}|" "$file"
+            [ "$(yq "$TAG_PATH" "$file")" = "$TAG" ]
+            git add "$file"
+          done <<< "$VALUES"
+
+          changed=$(git diff --cached --numstat | awk '{a+=$1; d+=$2} END {print a+0 "/" d+0}')
+          files=$(git diff --cached --name-only | wc -l)
+          if [ "$changed" != "$files/$files" ]; then
+            echo "::error::se esperaba una línea cambiada por archivo y hubo $changed en $files"
+            exit 1
+          fi
+
+      - name: Publicar en el gitops
+        working-directory: gitops
+        shell: bash
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          SERVICE: ${{ inputs.service }}
+          BRANCH: ${{ inputs.gitops-branch }}
+        # El gitops lo escriben muchos servicios a la vez: un push simple rebota cuando otro entró antes.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "El gitops ya apunta a $TAG"
+            exit 0
+          fi
+          git commit -q -m "chore(${SERVICE}): deploy ${TAG}"
+          for intento in 1 2 3 4 5 6; do
+            if git pull -q --rebase origin "$BRANCH" && git push -q origin "HEAD:$BRANCH"; then
+              echo "Desplegado $TAG"
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            echo "El gitops cambió mientras tanto (intento $intento)"
+            sleep $((intento * 5))
+          done
+          echo "::error::no se pudo publicar $TAG en el gitops"
+          exit 1
